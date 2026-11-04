@@ -113,7 +113,7 @@ Gap = (heuristic cost − exact cost) / exact cost.
 
 ## Limitations and assumptions
 
-- **Instance parameters are a modeling choice.** Grid size, window width, ride factor, capacity, fleet size and the objective weights (1, 0.5, 0.5, 1) were chosen for these experiments and should be confirmed by the team before reporting.
+- **Instance parameters are a modeling choice.** Grid size, window width, ride factor, capacity, fleet size and the objective weights (1, 0.5, 0.5, 1) were chosen for these experiments and should be confirmed yall.
 - **Earliest-start scheduling.** The heuristic never delays a stop on purpose, while the exact solver picks times freely. Part of the measured gap comes from this, not only from routing.
 - **Small exact range.** The optimum is known only up to 10 requests, so the 1–3% figure should not be extended to larger instances.
 - **Runtime.** Times come from unoptimized Python on one machine and show trends, not benchmarks.
