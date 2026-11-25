@@ -1,12 +1,13 @@
 import pandas as pd, numpy as np, json, time
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
-import sys; sys.path.insert(0, '/home/claude/darp2')
+import os, sys; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paths import RESULTS, FIGS; FIGS.mkdir(parents=True, exist_ok=True)
 BLUE, ORANGE, AQUA, INK, GREY = '#257de0', '#f47230', '#00b894', '#191919', '#9c9c9c'
 plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 9, 'axes.spines.top': False, 'axes.spines.right': False, 'axes.edgecolor': '#666666',
                      'axes.labelcolor': '#191919', 'xtick.color': '#444444', 'ytick.color': '#444444', 'axes.grid': True, 'grid.color': '#e6e6e6', 'grid.linewidth': 0.6, 'axes.axisbelow': True})
 out = {}
-M = pd.read_csv('results_main.csv'); S = pd.read_csv('results_sweeps.csv'); G = pd.read_csv('results_graphs.csv'); SC = pd.read_csv('results_scaling.csv'); TH = pd.read_csv('results_threads.csv')
+M = pd.read_csv(RESULTS / 'results_main.csv'); S = pd.read_csv(RESULTS / 'results_sweeps.csv'); G = pd.read_csv(RESULTS / 'results_graphs.csv'); SC = pd.read_csv(RESULTS / 'results_scaling.csv'); TH = pd.read_csv(RESULTS / 'results_threads.csv')
 
 # ---- capacity model: requests served per vehicle at saturation (served*n/m) ----
 S['per_veh'] = S.served * 1.0 / S.m
@@ -26,7 +27,7 @@ for ax, n in zip(axs, (100, 500)):
     ax.plot(xs, np.minimum(100, 100 * k / xs), ls='--', color=GREY, lw=1.2, label=f'Capacity model, kappa = {k:g} requests/vehicle')
     ax.set_title(f'n = {n} requests', fontsize=9.5, loc='left'); ax.set_xlabel('requests per vehicle, n/m'); ax.set_ylim(0, 105); ax.set_xlim(4, 62)
 axs[0].set_ylabel('requests served (%)'); axs[0].legend(fontsize=7.2, frameon=False, loc='lower left')
-fig.tight_layout(); fig.savefig('figs/fig1_fleet.png', dpi=200); plt.close(fig)
+fig.tight_layout(); fig.savefig(FIGS / 'fig1_fleet.png', dpi=200); plt.close(fig)
 
 # ---- Fig 2: heatmap ratio x W (static, n=100 and 500) ----
 fig, axs = plt.subplots(1, 2, figsize=(7.2, 3.0))
@@ -37,7 +38,7 @@ for ax, n in zip(axs, (100, 500)):
     for i in range(t.shape[0]):
         for j in range(t.shape[1]): ax.text(j, i, f'{t.values[i, j]:.0f}', ha='center', va='center', fontsize=7, color='white' if t.values[i, j] > 60 else INK)
     ax.set_title(f'n = {n}', fontsize=9.5, loc='left'); ax.set_xlabel('time-window width W (min)'); ax.set_ylabel('requests per vehicle, n/m'); ax.grid(False)
-fig.tight_layout(); fig.savefig('figs/fig2_heatmap.png', dpi=200); plt.close(fig)
+fig.tight_layout(); fig.savefig(FIGS / 'fig2_heatmap.png', dpi=200); plt.close(fig)
 
 # ---- Fig 3: window sweep at ratio 20 and 30 ----
 fig, axs = plt.subplots(1, 2, figsize=(7.2, 2.7), sharey=True)
@@ -47,10 +48,10 @@ for ax, n in zip(axs, (100, 500)):
         ax.plot(g.index, g.values, '-o', color=c, lw=1.6, ms=4, mec='white', mew=0.8, label=f'n/m = {ratio}')
     ax.set_xscale('log'); ax.set_xticks([2, 4, 8, 15, 30, 60]); ax.set_xticklabels([2, 4, 8, 15, 30, 60]); ax.set_xlabel('time-window width W (min)'); ax.set_title(f'n = {n}', fontsize=9.5, loc='left'); ax.set_ylim(0, 105)
 axs[0].set_ylabel('requests served (%), static'); axs[0].legend(fontsize=7.5, frameon=False, loc='lower right')
-fig.tight_layout(); fig.savefig('figs/fig3_windows.png', dpi=200); plt.close(fig)
+fig.tight_layout(); fig.savefig(FIGS / 'fig3_windows.png', dpi=200); plt.close(fig)
 
 # ---- Fig 4: predictions vs actual, per family and size ----
-P = pd.read_csv('prediction_vs_actual.csv')
+P = pd.read_csv(RESULTS / 'prediction_vs_actual.csv')
 fig, axs = plt.subplots(1, 2, figsize=(7.2, 3.1), sharex=True, sharey=True)
 for ax, (a, p, ttl) in zip(axs, (('act_s', 'pred_s', 'Static'), ('act_d', 'pred_d', 'Dynamic'))):
     ax.plot([0, 100], [0, 100], color=GREY, lw=1, ls='--')
@@ -58,7 +59,7 @@ for ax, (a, p, ttl) in zip(axs, (('act_s', 'pred_s', 'Static'), ('act_d', 'pred_
     for _, r in P.iterrows():
         if abs(r[p] - r[a]) > 12: ax.annotate(f"{r.f}/{r.n}", (r[p], r[a]), fontsize=6.5, xytext=(3, 3), textcoords='offset points', color='#444444')
     ax.set_xlabel('predicted served (%)'); ax.set_title(ttl, fontsize=9.5, loc='left'); ax.set_xlim(25, 105); ax.set_ylim(25, 105)
-axs[0].set_ylabel('measured served (%)'); fig.tight_layout(); fig.savefig('figs/fig4_predictions.png', dpi=200); plt.close(fig)
+axs[0].set_ylabel('measured served (%)'); fig.tight_layout(); fig.savefig(FIGS / 'fig4_predictions.png', dpi=200); plt.close(fig)
 
 # ---- Fig 5: runtime and steps vs n (log-log) ----
 fig, axs = plt.subplots(1, 2, figsize=(7.2, 3.0))
@@ -69,7 +70,7 @@ for mode, (l, c) in lab.items():
 ns = np.array([100, 5000.]); axs[0].plot(ns, 3e-3 * (ns / 100) ** 2, color=GREY, ls='--', lw=1, label='slope 2 reference'); axs[1].plot(ns, 3.8e5 * (ns / 100) ** 2, color=GREY, ls='--', lw=1)
 for ax, yl in zip(axs, ('running time (s, median of 3 seeds)', 'elementary steps (stop evaluations)')):
     ax.set_xscale('log'); ax.set_yscale('log'); ax.set_xlabel('number of requests n  (n/m = 10)'); ax.set_ylabel(yl)
-axs[0].legend(fontsize=7, frameon=False, loc='upper left'); fig.tight_layout(); fig.savefig('figs/fig5_runtime.png', dpi=200); plt.close(fig)
+axs[0].legend(fontsize=7, frameon=False, loc='upper left'); fig.tight_layout(); fig.savefig(FIGS / 'fig5_runtime.png', dpi=200); plt.close(fig)
 fits = {}
 for mode in lab:
     g = SC[(SC['mode'] == mode) & (SC.n >= 100)].groupby('n').agg(rt=('runtime', 'median'), st=('steps', 'median'))
@@ -102,5 +103,5 @@ ap = []
 for r_, c_ in ((8, 8), (12, 12), (20, 20), (30, 30), (45, 45), (60, 60)):
     nv, E = gen.grid_graph(r_, c_); t0 = time.time(); gen.build(nv, E); ap.append((nv, len(E), time.time() - t0))
 out['apsp'] = pd.DataFrame(ap, columns=['V', 'E', 'seconds']).round(4)
-pd.to_pickle(out, 'analysis_out.pkl')
+pd.to_pickle(out, RESULTS / 'analysis_out.pkl')
 for k, v in out.items(): print('==', k); print(v)

@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
+bin/
+*.o
+results/*/logs/
+results/task56/analysis_out.pkl
+logs/

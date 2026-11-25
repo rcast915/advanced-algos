@@ -1,6 +1,7 @@
 """Independent validator and metrics. Works from the instance dict (numpy) and the solver's JSON output only."""
 import json, subprocess, numpy as np, os, tempfile
 import gen
+from paths import SOLVER
 EPS = 1e-6
 
 def validate(I, sol, mode):
@@ -61,7 +62,7 @@ def metrics(I, sol):
 
 def run(I, mode, threads=1, passes=30, tag=None):
     d = tempfile.mkdtemp(prefix='darp_'); p = os.path.join(d, 'inst.txt'); gen.write_instance(I, p)
-    out = subprocess.run(['/home/claude/darp2/solver', p, mode, str(threads), str(passes)], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run([str(SOLVER), p, mode, str(threads), str(passes)], capture_output=True, text=True, check=True).stdout
     sol = json.loads(out); ok, bad = validate(I, sol, mode)
     os.remove(p); os.rmdir(d)
     return sol, ok, bad

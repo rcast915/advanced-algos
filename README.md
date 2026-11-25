@@ -1,96 +1,154 @@
-# Static Dial-a-Ride (DARP): Heuristic vs. Exact Solver
+# Dial-a-Ride (DARP): Heuristics, Exact Solver, Online Variant, GPU Add-on
 
 Team 6 – Advanced Algorithms (Alexander Karl, Jenna Murphree, Ray Castaneda)
 
-This folder holds the code and results for Task 3 (a heuristic for the static DARP, benchmarked against an exact solver) and the experiment data behind Tasks 3–4. It implements the v2 formal model from our Task 2 description: exactly-once service, same vehicle for pickup and dropoff, precedence, timing, time windows, return by horizon H, maximum ride time, and capacity (C1–C8).
+One project, built in three stages on the same formal model (v2 from Task 2: exactly-once service, same vehicle for pickup and dropoff,
+precedence, timing, time windows, return by horizon H, maximum ride time, capacity — constraints C1–C8):
 
-## Files
+| Stage | Task | What | Where |
+|---|---|---|---|
+| 1 | 3–4 | Python prototype: insertion + relocate heuristic, validated against an exact MIP (HiGHS) | `prototype/` |
+| 2 | 5–6 | Same algorithm in C++/OpenMP on road-network graphs, plus an online (dynamic) mode; six instance families, sweeps, pre-registered predictions | `solver/`, `experiments/` |
+| 3 | optional | CUDA offload of candidate-insertion evaluation (H100) | `solver/gpu*`, `docs/GPU.md` |
 
-| File | What it is |
-|---|---|
-| `darp.py` | Instance generator, independent validator, insertion heuristic, relocate local search |
-| `exact.py` | Exact 3-index mixed-integer program solved with HiGHS (via `scipy.optimize.milp`) |
-| `experiments.py` | Runs both experiment sets and writes the CSVs |
-| `results_small.csv` | 90 runs, n = 4–10 requests: heuristic vs. exact |
-| `results_large.csv` | 60 runs, n = 10–100 requests: heuristic only |
-| `env.txt` | Python, numpy, scipy versions and platform used |
-| `darp_small_results.xlsx` | Summary table (formulas) and all small-instance runs |
+The written report is `docs/Project2-Team6-Tasks56.docx`.
+
+## Layout
+
+```
+Makefile                 builds bin/solver_cpu | bin/solver_stub | bin/solver_gpu
+solver/
+  solver.cpp             C++ solver: static, static_nols, dynamic modes (GPU hook behind #ifdef USE_CUDA)
+  gpu.h gpu.cu           CUDA candidate evaluator (shared host/device core in gpu.h)
+  gpu_stub.cpp           serial CPU emulation of the GPU path, for testing without a GPU
+prototype/               Task 3 (pure Python + scipy)
+  darp.py                instance generator, validator, insertion heuristic, relocate local search
+  exact.py               exact 3-index MIP via scipy.optimize.milp (HiGHS)
+  experiments.py         small (vs exact) and large (heuristic only) runs
+experiments/             Tasks 5-6 pipeline (drives the C++ solver)
+  paths.py               all repo paths in one place (env overrides: DARP_SOLVER, DARP_RESULTS)
+  gen.py                 graphs, the six instance families, instance file writer
+  validate.py            independent validator + metrics; run() calls the solver binary
+  run_experiments.py     main | scaling | threads | graphs | sweeps
+  analyze.py tables.py   figures, fitted exponents, markdown tables
+  parity.py bench.py     CPU vs GPU/stub parity check, GPU timing
+  run_all.sh             every experiment step, then analysis
+results/
+  task3/                 results_small.csv, results_large.csv, env.txt
+  task56/                results_*.csv, predictions (+ sha256, timestamp), prediction_vs_actual.csv, figs/, tables/
+docs/                    report (.docx), GPU.md
+docker/Dockerfile        toolchain image (CUDA 13 devel + g++ + Python stack)
+submit_punakha.sh        sbatch wrapper: build image, run DARP_JOB inside it on an H100
+jobs/                    check.sh (cpu+stub parity), gpu.sh (CUDA build + parity), bench.sh (timing)
+```
 
 ## Quick start
 
-Requires Python 3, numpy, scipy and pandas (pandas only for summarizing). Keep the three `.py` files in one folder.
+Requirements: Python 3 with numpy, scipy, pandas, matplotlib; g++ with OpenMP; nvcc only for the GPU build.
+Run everything from the repo root.
 
-```
-python experiments.py small    # heuristic vs. exact, writes results_small.csv (a few minutes)
-python experiments.py large    # heuristic only, writes results_large.csv (several minutes)
+```bash
+make cpu                                         # -> bin/solver_cpu
+make stub                                        # -> bin/solver_stub (GPU logic, emulated on the CPU)
+
+# Stage 1 (Task 3)
+python3 prototype/experiments.py small           # heuristic vs exact, n = 4-10 (minutes; 120 s MIP limit per instance)
+python3 prototype/experiments.py large           # heuristic only, n = 10-100
+
+# Stage 2 (Tasks 5-6)
+python3 experiments/run_experiments.py main      # or scaling | threads | graphs | sweeps
+python3 experiments/analyze.py                   # figures -> results/task56/figs
+python3 experiments/tables.py                    # tables  -> results/task56/tables
+experiments/run_all.sh                           # all of the above, logs in results/task56/logs
+
+# Stage 3 (GPU) — see docs/GPU.md
+python3 experiments/parity.py bin/solver_cpu bin/solver_stub DARP_GPU=1 DARP_GPU_MIN=1
 ```
 
-`darp.py` uses only the standard library:
+The experiment scripts write into `results/` and **overwrite the committed results**. For a re-run, point them elsewhere:
+`DARP_RESULTS=/path/to/scratch python3 experiments/run_experiments.py main`. To use a different solver binary, set `DARP_SOLVER`.
+
+**On punakha (H100, Slurm + rootless Docker):** nothing runs on the login node. `submit_punakha.sh` builds the image in
+`docker/Dockerfile` (CUDA 13, g++/OpenMP, Python stack) and runs one script from `jobs/` inside it, with the repo mounted at `/work`:
+
+```bash
+mkdir -p logs/output logs/error
+sbatch submit_punakha.sh                          # jobs/check.sh: build cpu + stub, parity at n = 100
+DARP_JOB=jobs/gpu.sh sbatch submit_punakha.sh     # build CUDA solver, parity vs CPU at n = 100, 500
+DARP_JOB=jobs/bench.sh sbatch --time=2:00:00 submit_punakha.sh
+```
+
+`prototype/experiments.py small`, the `scaling`, `threads` and `sweeps` steps, `run_all.sh` and `bench.py` are long-running;
+give them their own job with a suitable `--time`.
+
+Using the prototype directly:
 
 ```python
-import darp
+import sys; sys.path.insert(0, 'prototype'); import darp
 I = darp.make_instance(n=20, seed=1)
 out = darp.solve_heuristic(I)          # dict: routes, T, Z, parts, Z_construct, ls_iters (or None on failure)
 ok, violations = darp.validate(I, out["routes"], out["T"])
 ```
 
-## How each part works
+## The algorithm (shared by both implementations)
 
-### `darp.py`
+**Objective.** `Z = 1.0·(total travel time) + 0.5·(total wait) + 0.5·(total excess ride time) + 1.0·(total wait beyond 10 min)`.
+Wait is measured from the start of each pickup window.
 
-**Instances.** `make_instance(n, seed)` places n requests on a 5×5 km grid with the depot at the center. Travel time is Euclidean distance at 0.5 km/min. Each request has a 15-minute pickup window starting at a random time, a delivery window derived from it, a 1-minute service time, and a maximum ride time of 2× the direct trip (direct trips are at least 3 minutes). Vehicles have capacity 4, the horizon is 480 minutes, and the fleet is about n/4 vehicles. The same seed always gives the same instance.
+**Insertion construction.** Requests are taken in order of earliest pickup. For each request, every vehicle and every
+(pickup, dropoff) position pair is tried; the cheapest feasible placement is kept.
 
-**Objective.** `Z = 1.0·(total travel time) + 0.5·(total wait) + 0.5·(total excess ride time) + 1.0·(total wait beyond 10 min)`. Wait is measured from the start of each pickup window.
+**Feasibility check.** A route is scheduled forward with every stop served as early as allowed. One pass checks time windows,
+capacity, ride-time limits and the return deadline, and computes the route's cost.
 
-**Insertion construction.** Requests are taken in order of earliest pickup. For each request, every vehicle and every position pair (pickup, dropoff) is tried. The cheapest placement that passes the feasibility check is kept. If no placement exists for some request, the heuristic returns `None` (it is sound but not complete).
+**Local search (relocate).** Remove one request and reinsert it at its best position in any route; accept only strict cost
+decreases; stop when nothing improves (or at the iteration/pass cap).
 
-**Feasibility check.** A route is scheduled forward with every stop served as early as allowed. This one pass checks time windows, capacity, ride-time limits and the return deadline, and computes the route's cost.
+**Validators.** `prototype/darp.py:validate` and `experiments/validate.py` re-check finished schedules against C1–C8 (and, for the
+online mode, release times and commitments) without using the solver's internal bookkeeping.
 
-**Local search (relocate).** Remove one request from its route and reinsert it at the best position in any route. Accept the move only if total cost strictly decreases. Stop when no request can be improved (or at the iteration cap).
+### Differences between the stages
 
-**Validator.** `validate` re-checks a finished schedule against C1–C8 and recomputes the objective without using the heuristic's internal bookkeeping. Both the heuristic's and the exact solver's output are passed through it.
+| | Prototype (`prototype/`) | C++ solver (`solver/`) |
+|---|---|---|
+| Geography | Euclidean 5×5 km plane, 0.5 km/min | road graphs (grid, 30×30 grid, ring, clusters, geometric) with all-pairs shortest paths |
+| Unplaceable request | whole heuristic returns `None` | request rejected; quality metric becomes **served %**; local search also retries rejected requests |
+| Modes | static | `static`, `static_nols` (insertion only), `dynamic` (online) |
+| Parallelism | none | OpenMP over vehicles; optional CUDA over (vehicle, a, b) |
 
-### `exact.py`
+**Dynamic mode.** Requests are revealed at release time (window start minus a lead time) and inserted immediately, without local search.
+At each decision time, stops already served are frozen, plus one pending stop per vehicle (the vehicle is committed to its next stop).
 
-`solve_exact(I, time_limit)` builds the standard 3-index model (one arc variable per vehicle and pair of stops, plus time, load, wait, excess and long-wait variables) and solves it with HiGHS. Unlike the heuristic, it chooses all stop times freely. It returns the optimal cost, or the best solution and a dual bound if the time limit hits. Practical up to about 10 requests.
+Solver usage: `bin/solver_cpu instance.txt MODE [threads] [ls_passes]`; it prints one JSON line (routes, times, served flags,
+runtime, step/eval counters, peak memory). Instance files are written by `experiments/gen.py:write_instance`.
 
-### `experiments.py`
+## Stage 1 results (Task 3)
 
-Runs the experiments below and records, per instance: cost of insertion alone, cost after local search, exact cost, solver status, runtimes, and validator results.
-
-## Experimental setup
+**Instances.** n requests on a 5×5 km grid, depot at the center; 15-minute pickup windows; 1-minute service; maximum ride 2× direct
+(direct trips ≥ 3 min); capacity 4; horizon 480 min; fleet ceil(n/4) (min 2). Same seed → same instance.
 
 | | Small set | Large set |
 |---|---|---|
 | Requests (n) | 4, 6, 8, 10 | 10, 20, 40, 60, 80, 100 |
 | Instances per size | 30, 30, 20, 10 (seeds 1…) | 10 (seeds 1001–1010) |
-| Methods | insertion, insertion + local search, exact | insertion, insertion + local search |
+| Methods | insertion, + local search, exact | insertion, + local search |
 | Exact time limit | 120 s | n/a |
-| Fleet | ceil(n/4) vehicles (min 2) | same |
 
-Environment details are in `env.txt`. Runs are single-threaded and deterministic given the seed; runtimes will vary by machine.
+Small instances. Gap = (heuristic − exact) / exact.
 
-## What the results show
-
-### Small instances: quality against the true optimum
-
-Gap = (heuristic cost − exact cost) / exact cost.
-
-| Requests | Runs | Solved to optimality | Mean gap, insertion only | Mean gap, + local search | Worst gap | Mean time, heuristic | Mean time, exact |
+| Requests | Runs | Optimal | Mean gap, insertion | Mean gap, + LS | Worst gap | Mean time, heuristic | Mean time, exact |
 |---|---|---|---|---|---|---|---|
 | 4 | 30 | 30 | 3.0% | 0.8% | 15.1% | 0.001 s | 0.06 s |
 | 6 | 30 | 30 | 6.2% | 1.9% | 13.4% | 0.004 s | 0.18 s |
 | 8 | 20 | 20 | 6.5% | 1.2% | 5.9% | 0.010 s | 0.8 s |
 | 10 | 10 | 10 | 10.1% | 2.9% | 6.4% | 0.022 s | 6.5 s |
 
-- All 90 heuristic schedules and all 90 exact schedules passed the validator.
-- The heuristic never beat the exact optimum (a sanity check on both).
-- Local search cuts the average gap to about 1–3%, but single instances can be much worse (worst case about 15%).
-- Exact solve time grows roughly 8× from 8 to 10 requests; the heuristic stays in milliseconds.
+- All 90 heuristic and all 90 exact schedules passed the validator; the heuristic never beat the optimum.
+- Local search brings the mean gap to about 1–3%; single instances can be up to about 15% worse.
 
-### Larger instances: feasibility and scaling
+Larger instances.
 
-| Requests | Feasible and valid | Local search improvement over insertion only | Mean time, insertion only | Mean time, + local search |
+| Requests | Feasible and valid | LS improvement over insertion | Mean time, insertion | Mean time, + LS |
 |---|---|---|---|---|
 | 10 | 10/10 | 3.0% | 0.006 s | 0.03 s |
 | 20 | 10/10 | 5.6% | 0.03 s | 0.19 s |
@@ -99,22 +157,44 @@ Gap = (heuristic cost − exact cost) / exact cost.
 | 80 | 10/10 | 6.7% | 1.0 s | 12.9 s |
 | 100 | 10/10 | 6.0% | 1.9 s | 26.1 s |
 
-- Every schedule was valid.
-- Local search improves on insertion by about 5–7% from n = 20 up, and accounts for most of the runtime.
-- Runtime grows polynomially (roughly n^2.5 to n^3 in this unoptimized Python), not exponentially.
-- There is no optimal value at these sizes, so these rows show scaling and feasibility, not distance from optimal.
+Runtime grows polynomially (about n^2.5 to n^3 in unoptimized Python). There is no optimum at these sizes, so these rows show scaling
+and feasibility, not distance from optimal.
 
-## Correctness and complexity notes (for Task 4)
+## Stage 2 experiments (Tasks 5–6)
 
-- **Valid output.** A request is inserted only if the forward-scheduled route passes every constraint, and local search accepts only feasible moves, so any returned schedule satisfies C1–C8. The validator confirms this empirically.
-- **Termination.** Insertion handles each request once. Local search accepts only strict cost decreases over a finite set of schedules, so it cannot cycle (an iteration cap is also in place).
-- **Not optimal, not complete.** It can return a worse-than-optimal schedule, and it can fail to find any schedule on a feasible instance.
-- **Cost.** Evaluating one candidate route is O(L) for a route of L stops. Trying all vehicle and position pairs for one request is about O(K·L³) with this direct implementation. Total insertion cost is therefore about O(n·K·L³) and each local search pass repeats a similar search for all n requests. Forward time slack would cut the per-candidate check to O(1) (not implemented).
+Common setup: 12×12 grid road network (144 nodes, 2 min per edge) unless stated, depot at the most central node, H = 480, Q = 4,
+service 1 min, pickups in [10, 360].
 
-## Limitations and assumptions
+| Family | Design | Stresses |
+|---|---|---|
+| F1 Baseline | grid, n/m = 10, 15-min windows, ρ = 2, lead 30 | — |
+| F2 Tight windows | as F1, 4-min windows | window width |
+| F3 Scarce fleet | as F1, n/m = 25 | fleet vs demand |
+| F4 Sparse ring | 100-node ring with chords | sparse, high-diameter network |
+| F5 Adversary A | 30×30 grid, identical-O/D pairs that can only pool if the first pickup is delayed | earliest-start scheduling |
+| F6 Adversary B | long decoy trips occupy every vehicle just before a burst | online commitments |
 
-- **Instance parameters are a modeling choice.** Grid size, window width, ride factor, capacity, fleet size and the objective weights (1, 0.5, 0.5, 1) were chosen for these experiments and should be confirmed yall.
-- **Earliest-start scheduling.** The heuristic never delays a stop on purpose, while the exact solver picks times freely. Part of the measured gap comes from this, not only from routing.
-- **Small exact range.** The optimum is known only up to 10 requests, so the 1–3% figure should not be extended to larger instances.
-- **Runtime.** Times come from unoptimized Python on one machine and show trends, not benchmarks.
-- **Not covered here.** The dynamic (online) problem and the written report and slides are not part of this folder.
+Experiment steps (`run_experiments.py`): `main` (6 families × n ∈ {20, 100, 500} × 3 modes), `scaling` (F1, n up to 5000),
+`threads` (1 vs 2 OpenMP threads), `graphs` (five network types), `sweeps` (fleet ratio × window width).
+Hypotheses were written and hashed before the experiment seeds ran (`results/task56/predictions.md`, `.sha256`, `.timestamp`;
+check with `cd results/task56 && sha256sum -c predictions.sha256`). `results_f5_control.csv` is a post-hoc control added after the main run.
+Results, figures and their discussion are in the report.
+
+## Correctness and complexity notes
+
+- **Valid output.** A request is inserted only if the forward-scheduled route passes every constraint, and local search accepts only
+  feasible moves, so every returned schedule satisfies C1–C8; the validators confirm this empirically.
+- **Termination.** Insertion handles each request once; local search accepts only strict decreases over a finite set (plus a cap).
+- **Not optimal, not complete.** It can return a worse-than-optimal schedule and can fail to serve requests on a feasible instance.
+- **Cost.** One candidate route evaluation is O(L) for L stops; trying all vehicle/position pairs for one request is about O(K·L³) in the
+  both implementations (the C++ solver reuses the prefix state and stops early on infeasibility, but the suffix is still re-scanned per
+  (a, b) pair, so it remains O(L³) per route in the worst case). Forward time slack would cut the per-candidate check to O(1) (not implemented).
+
+## Limitations
+
+- Instance parameters and objective weights (1, 0.5, 0.5, 1) are modeling choices.
+- Earliest-start scheduling never delays a stop on purpose, while the exact solver picks times freely; part of the gap comes from this
+  (F5 is built to exploit it).
+- The optimum is known only up to 10 requests; the 1–3% figure should not be extended to larger instances.
+- `exact.py` preallocates a 60,000-row constraint matrix, so it will fail (not just slow down) well beyond n ≈ 10.
+- The CUDA kernel (`solver/gpu.cu`) has not yet been compiled or run on a GPU; see `docs/GPU.md`.

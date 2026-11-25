@@ -1,4 +1,4 @@
-"""Parity + timing: compares solver binaries on generated instances. Usage: python3 parity.py CPU_BIN OTHER_BIN [env KEY=VAL ...] ; set N list via PARITY_N."""
+"""Parity + timing: compares solver binaries on generated instances. Usage (from repo root): python3 experiments/parity.py bin/solver_cpu bin/solver_stub [env KEY=VAL ...] ; set N list via PARITY_N."""
 import sys, os, json, subprocess, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen, validate
@@ -14,7 +14,7 @@ for fam in ('F1', 'F2', 'F5', 'F6'):
         for mode in ('static', 'dynamic'):
             sa, ta = run(a_bin, I, mode, {}); sb, tb = run(b_bin, I, mode, env)
             ma, mb = validate.metrics(I, sa), validate.metrics(I, sb); ok, why = validate.validate(I, sb, mode)
-            same = sa['R'] == sb['R'] if 'R' in sa else (ma['served_pct'] == mb['served_pct'] and abs(ma['Z'] - mb['Z']) < 1e-9)
+            same = sa['routes'] == sb['routes'] and sa['served'] == sb['served'] and abs(ma['Z'] - mb['Z']) < 1e-9
             bad += (not same) or (not ok)
             print(f'{fam} n={n:5d} {mode:8s} served {ma["served_pct"]:.1f}/{mb["served_pct"]:.1f}  Z {ma["Z"]:.6f}/{mb["Z"]:.6f}  valid={ok}  identical={same}  time {ta:.2f}s -> {tb:.2f}s')
 print('PARITY OK' if bad == 0 else f'PARITY FAILED ({bad})')

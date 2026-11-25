@@ -1,7 +1,8 @@
 """Run all Task 5-6 experiments. Usage: python run_experiments.py main|scaling|sweeps|graphs|threads"""
-import sys, csv, time, statistics, numpy as np
-sys.path.insert(0, '/home/claude/darp2')
+import os, sys, csv, time, statistics, numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen, validate
+from paths import RESULTS
 
 SEEDS = {20: [1, 2, 3, 4, 5], 100: [1, 2, 3, 4, 5], 500: [1, 2, 3]}
 
@@ -23,6 +24,7 @@ def write(rows, path):
     for r in rows:
         for k in r:
             if k not in keys: keys.append(k)
+    RESULTS.mkdir(parents=True, exist_ok=True); path = RESULTS / path
     with open(path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(rows)
 
