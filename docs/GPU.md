@@ -25,5 +25,12 @@ Without a GPU, step 2 can be run against `bin/solver_stub` to test everything ex
   (stub and H100, same 16 instances). `results/gpu/bench_h100_step1b.csv` (interactive session, 2 CPUs):
   GPU / 1-thread CPU 0.14x (n = 500), 1.42x (2000), 4.58x (5000), 8.64x (10000). Wall times include about 0.6-0.7 s of CUDA init.
   Profile (`experiments/profile_gpu.py`, n = 5000): kernel 66 %, copies 29 %, host prep 2 % of the GPU search time.
+* Step 1c (exact delivery-range pruning: for each feasible pickup, delivery positions past the first replay failure are skipped):
+  38x fewer (a, b) pairs; `results/gpu/bench_h100_step1c.csv`: 9.84x at n = 10000.
+* Step 2 (batched local search): the next K requests are evaluated against the current solution in one GPU call and decided in
+  order; at the first accepted move the rest of the batch is discarded and re-evaluated. Same decisions as the sequential loop, so
+  results stay bit-identical (PARITY OK, stub and H100). K adapts between 4 and `DARP_GPU_BATCH` (default 128; 1 disables batching).
+  `results/gpu/bench_h100_step2.csv`: GPU / 1-thread CPU 0.15x (n = 500), 2.74x (2000), 15.72x (5000), 34.84x (10000);
+  vs 2 CPU threads at n = 10000: 22.9x. GPU wall time at n = 10000: 254 s (baseline) -> 5.26 s.
 * Before steps 1a/1b the GPU evaluated each (a, b) from scratch (no prefix reuse), about L times more arithmetic than the CPU.
 * Routes longer than 126 stops fall back to the CPU. Step counters do not include GPU work.

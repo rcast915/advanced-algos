@@ -70,8 +70,8 @@ __global__ void k_scatter(GpuSlot* slots, const int* idx, const GpuSlot* upd) { 
   int* dst = reinterpret_cast<int*>(slots + idx[blockIdx.x]); const int* src = reinterpret_cast<const int*>(upd + blockIdx.x);
   for (int w = threadIdx.x; w < (int)(sizeof(GpuSlot) / sizeof(int)); w += blockDim.x) dst[w] = src[w];
 }
-__global__ void k_eval_slots(GpuInstance G, const GpuSlot* slots, const int* cand, int ireq, double theta, Best* out, unsigned long long* cnt) {
-  const GpuSlot& S = slots[cand[blockIdx.x]];
+__global__ void k_eval_slots(GpuInstance G, const GpuSlot* slots, const int* cand, const int* req, double theta, Best* out, unsigned long long* cnt) {
+  const GpuSlot& S = slots[cand[blockIdx.x]]; const int ireq = req[blockIdx.x];
   if (!S.feasible) { if (threadIdx.x == 0) out[blockIdx.x] = Best{1e300, -1, -1}; return; }   // uniform per block: no thread reaches a barrier
   GpuCand m; m.off = 0; m.qoff = 0; m.len = S.len; m.k0 = S.k0; m.base = S.base;
   eval_route(G, m, S.stops, S.pp, S.Tt, S.Sc, S.Sl, ireq, theta, out + blockIdx.x, cnt);
@@ -136,22 +136,22 @@ bool gpu_slots_init(int nslots) {
   CK(cudaMemset(dslots, 0, (size_t)nslots * sizeof(GpuSlot)));     // len 0, feasible 0 until first upload
   return true;
 }
-bool gpu_eval_slots(int nc, const int* cand, int nupd, const int* upd_idx, const GpuSlot* upd, int ireq, double theta, double* od, int* oa, int* ob) {
+bool gpu_eval_slots(int nc, const int* cand, const int* req, int nupd, const int* upd_idx, const GpuSlot* upd, double theta, double* od, int* oa, int* ob) {
   double t0 = g_prof_on ? now_s() : 0.0, t1;
-  size_t ni = (size_t)nc + nupd;
+  size_t ni = 2 * (size_t)nc + nupd;                                  // one index buffer: block slots | block requests | updated slots
   if ((size_t)nc > cap_c) { cudaFree(dmeta); cudaFree(dout); cap_c = nc * 2; CK(cudaMalloc(&dmeta, cap_c * sizeof(GpuCand))); CK(cudaMalloc(&dout, cap_c * sizeof(Best))); }
   if (ni > cap_i) { cudaFree(didx); cap_i = ni * 2; CK(cudaMalloc(&didx, cap_i * sizeof(int))); }
   if ((size_t)nupd > cap_u) { cudaFree(dupd); cap_u = nupd * 2 + 4; CK(cudaMalloc(&dupd, cap_u * sizeof(GpuSlot))); }
   if (ni > cap_hi) { cudaFreeHost(hidx); cap_hi = ni * 2; CK(cudaMallocHost(&hidx, cap_hi * sizeof(int))); }
   if ((size_t)nc > cap_ho) { cudaFreeHost(hout); cap_ho = nc * 2; CK(cudaMallocHost(&hout, cap_ho * sizeof(Best))); }
   if (g_prof_on) { t1 = now_s(); g_gp.realloc += t1 - t0; t0 = t1; }
-  for (int c = 0; c < nc; c++) hidx[c] = cand[c];                     // one index buffer: candidate slots, then updated slots
-  for (int j = 0; j < nupd; j++) hidx[nc + j] = upd_idx[j];
+  for (int c = 0; c < nc; c++) { hidx[c] = cand[c]; hidx[nc + c] = req[c]; }
+  for (int j = 0; j < nupd; j++) hidx[2 * nc + j] = upd_idx[j];
   CK(cudaMemcpy(didx, hidx, ni * sizeof(int), cudaMemcpyHostToDevice));
   if (nupd > 0) CK(cudaMemcpy(dupd, upd, (size_t)nupd * sizeof(GpuSlot), cudaMemcpyHostToDevice));
   if (g_prof_on) { t1 = now_s(); g_gp.h2d += t1 - t0; t0 = t1; g_gp.bytes_h2d += (long long)(ni * sizeof(int) + (size_t)nupd * sizeof(GpuSlot)); }
-  if (nupd > 0) k_scatter<<<nupd, 256>>>(dslots, didx + nc, dupd);   // same stream: finishes before the evaluation starts
-  k_eval_slots<<<nc, BLOCK>>>(dG, dslots, didx, ireq, theta, dout, g_prof_on ? dcnt : nullptr);
+  if (nupd > 0) k_scatter<<<nupd, 256>>>(dslots, didx + 2 * nc, dupd);   // same stream: finishes before the evaluation starts
+  k_eval_slots<<<nc, BLOCK>>>(dG, dslots, didx, didx + nc, theta, dout, g_prof_on ? dcnt : nullptr);
   CK(cudaGetLastError());
   if (g_prof_on) { CK(cudaDeviceSynchronize()); t1 = now_s(); g_gp.kernel += t1 - t0; t0 = t1; }
   CK(cudaMemcpy(hout, dout, nc * sizeof(Best), cudaMemcpyDeviceToHost));   // also synchronizes

@@ -36,6 +36,10 @@ for n in ns:
                    ('kernel', 'kernel (launch + run)'), ('d2h', 'device->host copy')):
         print(f'    {lab:40s} {pg[k]:8.2f} s  {100 * pg[k] / max(pg["search"], 1e-12):5.1f} %  {1e6 * pg[k] / dc:8.1f} us/call')
     print(f'    {"other host work in search":40s} {host_other:8.2f} s  {100 * host_other / max(pg["search"], 1e-12):5.1f} %')
+    if pg.get('bat_calls'):
+        print(f'  local-search batches: {pg["bat_calls"]:,} GPU calls for {pg["bat_entries"]:,} requests evaluated '
+              f'(avg {pg["bat_entries"] / pg["bat_calls"]:.1f} per call), {pg["bat_used"]:,} used before an accepted move '
+              f'({100 * pg["bat_used"] / max(pg["bat_entries"], 1):.0f} %)')
     if pg['positions']:
         print(f'  kernel work: {pg["positions"]:,} pickup positions tried, {pg["feas_a"]:,} feasible ({100 * pg["feas_a"] / pg["positions"]:.1f} %), '
               f'{pg["pairs"]:,} (a,b) pairs evaluated in phase 2')

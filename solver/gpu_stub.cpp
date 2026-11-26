@@ -24,10 +24,10 @@ void gpu_shutdown() {}
 
 static std::vector<GpuSlot> hs;
 bool gpu_slots_init(int nslots) { hs.assign(nslots, GpuSlot()); for (auto& s : hs) { s.len = 0; s.k0 = 0; s.feasible = 0; s.base = 0; } return true; }
-bool gpu_eval_slots(int nc, const int* cand, int nupd, const int* upd_idx, const GpuSlot* upd, int ireq, double theta, double* od, int* oa, int* ob) {
+bool gpu_eval_slots(int nc, const int* cand, const int* req, int nupd, const int* upd_idx, const GpuSlot* upd, double theta, double* od, int* oa, int* ob) {
   for (int j = 0; j < nupd; j++) hs[upd_idx[j]] = upd[j];
   for (int c = 0; c < nc; c++) {
-    const GpuSlot& S = hs[cand[c]]; double bd = 1e300; int ba = -1, bb = -1;
+    const GpuSlot& S = hs[cand[c]]; const int ireq = req[c]; double bd = 1e300; int ba = -1, bb = -1;
     if (S.feasible) {
       GpuCand m; m.off = 0; m.qoff = 0; m.len = S.len; m.k0 = S.k0; m.base = S.base;
       for (int a = m.k0; a <= m.len; a++) {

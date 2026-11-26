@@ -197,4 +197,4 @@ Results, figures and their discussion are in the report.
   (F5 is built to exploit it).
 - The optimum is known only up to 10 requests; the 1–3% figure should not be extended to larger instances.
 - `exact.py` preallocates a 60,000-row constraint matrix, so it will fail (not just slow down) well beyond n ≈ 10.
-- The CUDA kernel (`solver/gpu.cu`) has not yet been compiled or run on a GPU; see `docs/GPU.md`.
+- GPU solver: bit-identical to the CPU solver on an H100; about 35x faster than one CPU thread at n = 10000 (static mode). See `docs/GPU.md`.

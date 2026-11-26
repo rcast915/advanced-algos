@@ -130,8 +130,9 @@ struct GpuSlot {
   int stops[GPU_LMAX]; int pp[GPU_LMAX]; double Tt[GPU_LMAX]; double Sc[GPU_LMAX + 1]; int Sl[GPU_LMAX + 1];
 };
 bool gpu_slots_init(int nslots);
-// Writes upd[j] into slot upd_idx[j] (j < nupd), then evaluates request ireq against the routes in cand_slots[0 .. ncand).
-bool gpu_eval_slots(int ncand, const int* cand_slots, int nupd, const int* upd_idx, const GpuSlot* upd, int ireq, double theta,
+// Writes upd[j] into slot upd_idx[j] (j < nupd), then evaluates, for each block c < nblk, request blk_req[c] against the route in
+// slot blk_slot[c]. One call can therefore cover several requests (batched local search) as well as a single one.
+bool gpu_eval_slots(int nblk, const int* blk_slot, const int* blk_req, int nupd, const int* upd_idx, const GpuSlot* upd, double theta,
                     double* out_delta, int* out_a, int* out_b);
 
 // Profiling counters, summed over all gpu_eval calls. Collected only after gpu_set_prof(true); the kernel is then followed by a

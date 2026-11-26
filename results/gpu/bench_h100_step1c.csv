@@ -1,0 +1,5 @@
+n,cpu_1thread_s,cpu_2thread_s,gpu_s,speedup_vs_1thread,family,seed,mode,run,node,gpu,cpus,version
+500,0.12,0.08,0.87,0.14,F1,1,static,interactive srun,hopper001,NVIDIA H100 80GB HBM3,2,step 1c (+ delivery-range pruning)
+2000,2.59,1.71,1.69,1.54,F1,1,static,interactive srun,hopper001,NVIDIA H100 80GB HBM3,2,step 1c (+ delivery-range pruning)
+5000,31.14,20.48,6.25,4.99,F1,1,static,interactive srun,hopper001,NVIDIA H100 80GB HBM3,2,step 1c (+ delivery-range pruning)
+10000,185.74,122.88,18.88,9.84,F1,1,static,interactive srun,hopper001,NVIDIA H100 80GB HBM3,2,step 1c (+ delivery-range pruning)

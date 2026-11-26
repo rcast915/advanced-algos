@@ -20,7 +20,7 @@
 using namespace std;
 // Optional profiling (DARP_PROF=1): wall-time split of the candidate search, one JSON line on stderr at exit. Off by default; never changes results.
 static inline double now_s() { return chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count(); }
-struct Prof { bool on = false; double search = 0, prep = 0, dev = 0; long long calls = 0, dev_calls = 0, cands = 0, stops = 0, fallback = 0, upd = 0; };
+struct Prof { bool on = false; double search = 0, prep = 0, dev = 0; long long calls = 0, dev_calls = 0, cands = 0, stops = 0, fallback = 0, upd = 0, bat_calls = 0, bat_entries = 0, bat_used = 0; };
 static Prof g_prof;
 // Resident memory from /proc (VmRSS now, VmHWM = peak of this process only; ru_maxrss would inherit the parent's peak).
 static long proc_kb(const char* key) {
@@ -134,6 +134,7 @@ static vector<int> insert_pair(const vector<int>& r, int i, int n, int a, int b)
 
 struct Sol {
   vector<vector<int>> R; vector<vector<double>> T; vector<char> served;
+  vector<int> veh;                                                // veh[i] = vehicle whose route holds request i (kept up to date by apply)
 };
 
 static bool read_inst(const char* path, Inst& I) {
@@ -152,6 +153,8 @@ static bool read_inst(const char* path, Inst& I) {
 #ifdef USE_CUDA
 static bool g_gpu = false; static int g_gpu_min = 32;
 static bool g_resident = false; static vector<char> g_dirty;     // resident routes (static mode): g_dirty[k] = route k changed since last upload
+static int g_batch = 128;                                         // max local-search requests per GPU call (DARP_GPU_BATCH; 1 = one at a time).
+                                                                  // The batch size adapts between min(4, max) and max; results never depend on it.
 #endif
 struct Ctx { const Inst& I; int threads; vector<Scratch> S; Ctx(const Inst& i, int t) : I(i), threads(t), S(t) { for (auto& s : S) s.pick.assign(i.n, 0.0); } };
 
@@ -206,8 +209,8 @@ static Placement best_over_vehicles_impl(Ctx& C, const Sol& sol, const vector<in
     bool too_long = false;
     for (int k : cands) { const vector<int>& r = (k == override_k) ? *over_r : sol.R[k]; if ((int)r.size() + 2 > GPU_LMAX) { too_long = true; break; } }
     if (!too_long) {
-      static thread_local vector<int> cslot, uidx; static thread_local vector<GpuSlot> upd;
-      cslot.clear(); uidx.clear(); upd.clear();
+      static thread_local vector<int> cslot, creq, uidx; static thread_local vector<GpuSlot> upd;
+      cslot.clear(); uidx.clear(); upd.clear(); creq.assign(cands.size(), i);
       for (int k : cands) {
         if (k == override_k) { upd.emplace_back(); uidx.push_back(m); fill_slot(I, *over_r, *over_T, theta, C.S[0], upd.back()); cslot.push_back(m); }
         else {
@@ -218,7 +221,7 @@ static Placement best_over_vehicles_impl(Ctx& C, const Sol& sol, const vector<in
       if (g_prof.on) g_prof.prep += now_s() - tp0;
       vector<double> od(cands.size()); vector<int> oa(cands.size()), ob(cands.size());
       double td0 = g_prof.on ? now_s() : 0.0;
-      if (!gpu_eval_slots((int)cslot.size(), cslot.data(), (int)upd.size(), uidx.data(), upd.data(), i, theta, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval_slots failed\n"); exit(2); }
+      if (!gpu_eval_slots((int)cslot.size(), cslot.data(), creq.data(), (int)upd.size(), uidx.data(), upd.data(), theta, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval_slots failed\n"); exit(2); }
       if (g_prof.on) { g_prof.dev += now_s() - td0; g_prof.dev_calls++; g_prof.cands += (long long)cslot.size(); g_prof.upd += (long long)upd.size(); }
       Placement p;
       for (size_t c = 0; c < cands.size(); c++) if (oa[c] >= 0 && od[c] < p.delta) { p.delta = od[c]; p.veh = cands[c]; p.a = oa[c]; p.b = ob[c]; }
@@ -282,6 +285,7 @@ static void apply(Ctx& C, Sol& sol, int k, const vector<int>& nr, int k0, double
   vector<double> T; double cost;
   suffix_cost(C.I, nr, sol.T[k], k0, theta, C.S[0], cost, &T);
   sol.R[k] = nr; sol.T[k] = T;
+  for (int v : nr) if (v < C.I.n) sol.veh[v] = k;
 #ifdef USE_CUDA
   if (!g_dirty.empty()) g_dirty[k] = 1;
 #endif
@@ -289,6 +293,72 @@ static void apply(Ctx& C, Sol& sol, int k, const vector<int>& nr, int k0, double
 static double route_cost(const Inst& I, const vector<int>& r, Scratch& S, bool& ok) {
   vector<double> none; double c = 0; ok = suffix_cost(I, r, none, 0, 0.0, S, c, nullptr); return c;
 }
+
+// One local-search step for request i, split into "prepare" (what to evaluate) and "decide/apply" so the sequential loop and the
+// batched GPU loop run exactly the same logic.
+struct LsEntry { int i = -1; bool repair = false; int ks = -1; vector<int> rem; vector<double> Trem; double saving = 0; };
+static bool ls_prepare(Ctx& C, const Sol& sol, int i, LsEntry& e) {   // false: nothing to evaluate for i (removal leaves an infeasible route)
+  const Inst& I = C.I; int n = I.n;
+  e.i = i; e.repair = !sol.served[i]; e.ks = -1; e.rem.clear(); e.Trem.clear(); e.saving = 0;
+  if (e.repair) return true;                                  // repair: try to serve a rejected request
+  int ks = sol.veh[i];
+  e.ks = ks;
+  for (int v : sol.R[ks]) if (v != i && v != n + i) e.rem.push_back(v);
+  bool ok1, ok2; double c_old = route_cost(I, sol.R[ks], C.S[0], ok1), c_rem = route_cost(I, e.rem, C.S[0], ok2);
+  if (!ok2) return false;                                     // removal leaves an infeasible route: treated as infinite cost
+  e.saving = c_old - c_rem;
+  double dummy; suffix_cost(I, e.rem, {}, 0, 0.0, C.S[0], dummy, &e.Trem);
+  return true;
+}
+static Placement ls_eval(Ctx& C, const Sol& sol, const LsEntry& e) {
+  return e.repair ? best_over_vehicles(C, sol, nullptr, 0.0, e.i, -1, nullptr, nullptr) : best_over_vehicles(C, sol, nullptr, 0.0, e.i, e.ks, &e.rem, &e.Trem);
+}
+static bool ls_apply(Ctx& C, Sol& sol, const LsEntry& e, const Placement& p) {   // true if the solution changed
+  int n = C.I.n, i = e.i;
+  if (e.repair) {
+    if (p.veh < 0) return false;
+    apply(C, sol, p.veh, insert_pair(sol.R[p.veh], i, n, p.a, p.b), 0, 0.0); sol.served[i] = 1; return true;
+  }
+  if (!(p.veh >= 0 && p.delta < e.saving - 1e-7)) return false;
+  const vector<int>& base = (p.veh == e.ks) ? e.rem : sol.R[p.veh];
+  vector<int> nr = insert_pair(base, i, n, p.a, p.b);
+  if (p.veh != e.ks) apply(C, sol, e.ks, e.rem, 0, 0.0);
+  apply(C, sol, p.veh, nr, 0, 0.0);
+  return true;
+}
+
+#ifdef USE_CUDA
+// Evaluate every entry of a local-search batch against the CURRENT solution in one GPU call. Entry b uses its own override slot m + b
+// for its route with request i removed. Returns false (nothing evaluated, no state changed) if the batch cannot go to the GPU;
+// the caller then evaluates the entries one at a time. Same candidate lists and same selection rule as best_over_vehicles_impl.
+static bool ls_eval_batch(Ctx& C, const Sol& sol, const vector<LsEntry>& B, vector<Placement>& P) {
+  const Inst& I = C.I; int m = I.m;
+  double t0 = g_prof.on ? now_s() : 0.0;
+  for (int k = 0; k < m; k++) if ((int)sol.R[k].size() + 2 > GPU_LMAX) return false;
+  static thread_local vector<int> bslot, breq, bent, bveh, uidx; static thread_local vector<GpuSlot> upd;
+  bslot.clear(); breq.clear(); bent.clear(); bveh.clear(); uidx.clear(); upd.clear();
+  for (size_t b = 0; b < B.size(); b++) {                     // candidate list per entry, exactly as best_over_vehicles_impl builds it
+    const LsEntry& e = B[b]; int ov = e.repair ? -1 : e.ks; bool empty_taken = false; size_t first = bslot.size();
+    for (int k = 0; k < m; k++) {
+      const vector<int>& r = (k == ov) ? e.rem : sol.R[k];
+      if (r.empty()) { if (empty_taken) continue; empty_taken = true; }
+      bslot.push_back(k == ov ? m + (int)b : k); breq.push_back(e.i); bent.push_back((int)b); bveh.push_back(k);
+    }
+    if ((int)(bslot.size() - first) < g_gpu_min) return false;
+  }
+  for (int k = 0; k < m; k++) if (g_dirty[k]) { upd.emplace_back(); uidx.push_back(k); fill_slot(I, sol.R[k], sol.T[k], 0.0, C.S[0], upd.back()); g_dirty[k] = 0; }
+  for (size_t b = 0; b < B.size(); b++) if (!B[b].repair) { upd.emplace_back(); uidx.push_back(m + (int)b); fill_slot(I, B[b].rem, B[b].Trem, 0.0, C.S[0], upd.back()); }
+  if (g_prof.on) g_prof.prep += now_s() - t0;
+  size_t nb = bslot.size(); vector<double> od(nb); vector<int> oa(nb), ob(nb);
+  double td0 = g_prof.on ? now_s() : 0.0;
+  if (!gpu_eval_slots((int)nb, bslot.data(), breq.data(), (int)upd.size(), uidx.data(), upd.data(), 0.0, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval_slots failed\n"); exit(2); }
+  P.assign(B.size(), Placement());
+  for (size_t c = 0; c < nb; c++) { Placement& p = P[bent[c]]; if (oa[c] >= 0 && od[c] < p.delta) { p.delta = od[c]; p.veh = bveh[c]; p.a = oa[c]; p.b = ob[c]; } }
+  if (g_prof.on) { double t1 = now_s(); g_prof.dev += t1 - td0; g_prof.search += t1 - t0; g_prof.calls += (long long)B.size(); g_prof.dev_calls++;
+                   g_prof.cands += (long long)nb; g_prof.upd += (long long)upd.size(); g_prof.bat_calls++; g_prof.bat_entries += (long long)B.size(); }
+  return true;
+}
+#endif
 
 int main(int argc, char** argv) {
   if (argc < 3) { fprintf(stderr, "usage: solver inst MODE [threads] [ls_passes]\n"); return 1; }
@@ -305,13 +375,14 @@ int main(int argc, char** argv) {
     gpu_set_prof(g_prof.on);
     // DARP_GPU_RESIDENT=0 turns off resident routes (every call then re-sends all candidate routes, as the dynamic mode always does).
     g_resident = !(getenv("DARP_GPU_RESIDENT") && atoi(getenv("DARP_GPU_RESIDENT")) == 0);
+    if (getenv("DARP_GPU_BATCH")) g_batch = max(1, atoi(getenv("DARP_GPU_BATCH")));
     if (g_resident) {
-      if (!gpu_slots_init(m + 1)) { fprintf(stderr, "gpu_slots_init failed\n"); return 2; }
+      if (!gpu_slots_init(m + max(1, g_batch))) { fprintf(stderr, "gpu_slots_init failed\n"); return 2; }
       g_dirty.assign(m, 1);
     }
   }
 #endif
-  Sol sol; sol.R.assign(m, {}); sol.T.assign(m, {}); sol.served.assign(n, 0);
+  Sol sol; sol.R.assign(m, {}); sol.T.assign(m, {}); sol.served.assign(n, 0); sol.veh.assign(n, -1);
   vector<int> order(n); iota(order.begin(), order.end(), 0);
   long long ls_moves = 0, passes = 0, violations = 0; vector<double> decision_theta(n, -1);
   auto t0 = chrono::steady_clock::now();
@@ -325,24 +396,35 @@ int main(int argc, char** argv) {
       bool changed = true;
       while (changed && passes < max_passes) {
         changed = false; passes++;
-        for (int i = 0; i < n; i++) {
-          if (!sol.served[i]) {  // repair: try to serve a rejected request
-            Placement p = best_over_vehicles(C, sol, nullptr, 0.0, i, -1, nullptr, nullptr);
-            if (p.veh >= 0) { apply(C, sol, p.veh, insert_pair(sol.R[p.veh], i, n, p.a, p.b), 0, 0.0); sol.served[i] = 1; changed = true; ls_moves++; }
-            continue;
+        bool batched = false;
+#ifdef USE_CUDA
+        batched = g_gpu && g_resident && g_batch > 1;
+        if (batched) {
+          // Speculative batches: evaluate the next g_batch requests against the current solution in one GPU call, then decide them in
+          // order. Every entry before the first accepted move saw exactly the solution the sequential loop would have shown it; at the
+          // first accepted move the rest of the batch is discarded and the next batch starts right after it. Same results as below.
+          vector<LsEntry> B; vector<Placement> P; int i = 0;
+          const int kmin = min(4, g_batch); int K = min(8, g_batch);       // halve after an accepted move, double after a batch with none
+          while (i < n) {
+            B.clear(); int j = i;
+            while (j < n && (int)B.size() < K) { B.emplace_back(); if (!ls_prepare(C, sol, j, B.back())) B.pop_back(); j++; }
+            bool on_gpu = !B.empty() && ls_eval_batch(C, sol, B, P);
+            int next = j; bool accepted = false;
+            for (size_t b = 0; b < B.size(); b++) {
+              Placement p = on_gpu ? P[b] : ls_eval(C, sol, B[b]);
+              if (g_prof.on && on_gpu) g_prof.bat_used++;
+              if (ls_apply(C, sol, B[b], p)) { changed = true; ls_moves++; next = B[b].i + 1; accepted = true; break; }
+            }
+            K = accepted ? max(kmin, K / 2) : min(g_batch, K * 2);
+            i = next;
           }
-          int ks = -1; for (int k = 0; k < m && ks < 0; k++) for (int v : sol.R[k]) if (v == i) { ks = k; break; }
-          vector<int> rem; for (int v : sol.R[ks]) if (v != i && v != n + i) rem.push_back(v);
-          bool ok1, ok2; double c_old = route_cost(I, sol.R[ks], C.S[0], ok1), c_rem = route_cost(I, rem, C.S[0], ok2);
-          if (!ok2) continue;                       // removal leaves an infeasible route: treated as infinite cost
-          double saving = c_old - c_rem;
-          vector<double> Trem; double dummy; suffix_cost(I, rem, {}, 0, 0.0, C.S[0], dummy, &Trem);
-          Placement p = best_over_vehicles(C, sol, nullptr, 0.0, i, ks, &rem, &Trem);
-          if (p.veh >= 0 && p.delta < saving - 1e-7) {
-            const vector<int>& base = (p.veh == ks) ? rem : sol.R[p.veh];
-            vector<int> nr = insert_pair(base, i, n, p.a, p.b);
-            if (p.veh != ks) apply(C, sol, ks, rem, 0, 0.0);
-            apply(C, sol, p.veh, nr, 0, 0.0); changed = true; ls_moves++;
+        }
+#endif
+        if (!batched) {
+          LsEntry e;
+          for (int i = 0; i < n; i++) {
+            if (!ls_prepare(C, sol, i, e)) continue;
+            if (ls_apply(C, sol, e, ls_eval(C, sol, e))) { changed = true; ls_moves++; }
           }
         }
       }
@@ -375,9 +457,9 @@ int main(int argc, char** argv) {
 #ifdef USE_CUDA
     if (g_gpu) { GpuProf gp = gpu_get_prof(); h2d = gp.h2d; kern = gp.kernel; d2h = gp.d2h; realloc_s = gp.realloc; bytes = gp.bytes_h2d; positions = gp.positions; feas_a = gp.feas_a; pairs = gp.pairs; }
 #endif
-    fprintf(stderr, "{\"prof\":{\"runtime\":%.6f,\"search\":%.6f,\"calls\":%lld,\"prep\":%.6f,\"dev\":%.6f,\"dev_calls\":%lld,\"cands\":%lld,\"stops\":%lld,\"fallback\":%lld,\"upd\":%lld,"
+    fprintf(stderr, "{\"prof\":{\"runtime\":%.6f,\"search\":%.6f,\"calls\":%lld,\"prep\":%.6f,\"dev\":%.6f,\"dev_calls\":%lld,\"cands\":%lld,\"stops\":%lld,\"fallback\":%lld,\"upd\":%lld,\"bat_calls\":%lld,\"bat_entries\":%lld,\"bat_used\":%lld,"
                     "\"h2d\":%.6f,\"kernel\":%.6f,\"d2h\":%.6f,\"realloc\":%.6f,\"bytes_h2d\":%lld,\"positions\":%lld,\"feas_a\":%lld,\"pairs\":%lld,\"steps\":%lld,\"passes\":%lld,\"m\":%d}}\n",
-            secs, g_prof.search, g_prof.calls, g_prof.prep, g_prof.dev, g_prof.dev_calls, g_prof.cands, g_prof.stops, g_prof.fallback, g_prof.upd,
+            secs, g_prof.search, g_prof.calls, g_prof.prep, g_prof.dev, g_prof.dev_calls, g_prof.cands, g_prof.stops, g_prof.fallback, g_prof.upd, g_prof.bat_calls, g_prof.bat_entries, g_prof.bat_used,
             h2d, kern, d2h, realloc_s, bytes, positions, feas_a, pairs, steps, passes, m);
   }
   printf("{\"mode\":\"%s\",\"threads\":%d,\"runtime\":%.6f,\"steps\":%lld,\"evals\":%lld,\"maxrss_kb\":%ld,\"rss_load_kb\":%ld,\"ls_moves\":%lld,\"passes\":%lld,\"commit_violations\":%lld,\"served\":[", mode.c_str(), threads, secs, steps, evals, rss_peak, rss_load, ls_moves, passes, violations);
