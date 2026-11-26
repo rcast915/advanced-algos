@@ -9,9 +9,7 @@ precedence, timing, time windows, return by horizon H, maximum ride time, capaci
 |---|---|---|---|
 | 1 | 3–4 | Python prototype: insertion + relocate heuristic, validated against an exact MIP (HiGHS) | `prototype/` |
 | 2 | 5–6 | Same algorithm in C++/OpenMP on road-network graphs, plus an online (dynamic) mode; six instance families, sweeps, pre-registered predictions | `solver/`, `experiments/` |
-| 3 | optional | CUDA offload of candidate-insertion evaluation (H100) | `solver/gpu*`, `docs/GPU.md` |
-
-The written report is `docs/Project2-Team6-Tasks56.docx`.
+| 3 | optional | CUDA offload of candidate-insertion evaluation (H100) | `solver/gpu*` |
 
 ## Layout
 
@@ -36,7 +34,6 @@ experiments/             Tasks 5-6 pipeline (drives the C++ solver)
 results/
   task3/                 results_small.csv, results_large.csv, env.txt
   task56/                results_*.csv, predictions (+ sha256, timestamp), prediction_vs_actual.csv, figs/, tables/
-docs/                    report (.docx), GPU.md
 docker/Dockerfile        toolchain image (CUDA 13 devel + g++ + Python stack)
 submit_punakha.sh        sbatch wrapper: build image, run DARP_JOB inside it on an H100
 jobs/                    check.sh (cpu+stub parity), gpu.sh (CUDA build + parity), bench.sh (timing)
@@ -61,7 +58,7 @@ python3 experiments/analyze.py                   # figures -> results/task56/fig
 python3 experiments/tables.py                    # tables  -> results/task56/tables
 experiments/run_all.sh                           # all of the above, logs in results/task56/logs
 
-# Stage 3 (GPU) — see docs/GPU.md
+# Stage 3 (GPU) — see "GPU solver" below
 python3 experiments/parity.py bin/solver_cpu bin/solver_stub DARP_GPU=1 DARP_GPU_MIN=1
 ```
 
@@ -121,6 +118,22 @@ At each decision time, stops already served are frozen, plus one pending stop pe
 
 Solver usage: `bin/solver_cpu instance.txt MODE [threads] [ls_passes]`; it prints one JSON line (routes, times, served flags,
 runtime, step/eval counters, peak memory). Instance files are written by `experiments/gen.py:write_instance`.
+
+## GPU solver
+
+`make gpu` builds `bin/solver_gpu` (nvcc, `CUDA_ARCH=sm_90` for the H100 by default). Enable the GPU at run time with `DARP_GPU=1`.
+Results are bit-identical to the CPU solver (same routes, served set and Z); this needs `-ffp-contract=off` (g++) and
+`-fmad=false` (nvcc), which the Makefile sets. `experiments/parity.py` checks it; `experiments/profile_gpu.py` (with `DARP_PROF=1`)
+shows where the time goes; `experiments/bench.py` times CPU vs GPU.
+
+How it works: one thread block per candidate route; phase 1 tests every pickup position in O(1) from precomputed route states,
+phase 2 evaluates (pickup, delivery) pairs only for feasible pickups and only up to the first stop that the new passenger makes
+infeasible. In static mode the routes stay on the GPU (only changed routes are re-sent) and local search evaluates batches of
+requests per call, re-evaluating the rest of a batch after any accepted move so the decisions match the sequential loop.
+
+Run-time switches: `DARP_GPU_MIN` (fewest candidate routes worth a GPU call, default 32), `DARP_GPU_RESIDENT=0` (re-send all routes
+every call), `DARP_GPU_BATCH` (max local-search batch, default 128; 1 = no batching). Routes over 126 stops fall back to the CPU.
+Benchmarks: `results/gpu/` (H100; at n = 10000, 5.26 s on the GPU vs 183 s on one CPU thread).
 
 ## Stage 1 results (Task 3)
 
@@ -197,4 +210,4 @@ Results, figures and their discussion are in the report.
   (F5 is built to exploit it).
 - The optimum is known only up to 10 requests; the 1–3% figure should not be extended to larger instances.
 - `exact.py` preallocates a 60,000-row constraint matrix, so it will fail (not just slow down) well beyond n ≈ 10.
-- GPU solver: bit-identical to the CPU solver on an H100; about 35x faster than one CPU thread at n = 10000 (static mode). See `docs/GPU.md`.
+- GPU solver: bit-identical to the CPU solver on an H100; about 35x faster than one CPU thread at n = 10000 (static mode).
