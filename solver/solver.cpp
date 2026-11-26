@@ -18,6 +18,10 @@
 #include "gpu.h"
 #endif
 using namespace std;
+// Optional profiling (DARP_PROF=1): wall-time split of the candidate search, one JSON line on stderr at exit. Off by default; never changes results.
+static inline double now_s() { return chrono::duration<double>(chrono::steady_clock::now().time_since_epoch()).count(); }
+struct Prof { bool on = false; double search = 0, prep = 0, dev = 0; long long calls = 0, dev_calls = 0, cands = 0, stops = 0, fallback = 0, upd = 0; };
+static Prof g_prof;
 // Resident memory from /proc (VmRSS now, VmHWM = peak of this process only; ru_maxrss would inherit the parent's peak).
 static long proc_kb(const char* key) {
   ifstream f("/proc/self/status"); string line; size_t L = string(key).size();
@@ -147,12 +151,47 @@ static bool read_inst(const char* path, Inst& I) {
 
 #ifdef USE_CUDA
 static bool g_gpu = false; static int g_gpu_min = 32;
+static bool g_resident = false; static vector<char> g_dirty;     // resident routes (static mode): g_dirty[k] = route k changed since last upload
 #endif
 struct Ctx { const Inst& I; int threads; vector<Scratch> S; Ctx(const Inst& i, int t) : I(i), threads(t), S(t) { for (auto& s : S) s.pick.assign(i.n, 0.0); } };
 
+#ifdef USE_CUDA
+// Per-position route states for the GPU (layout in gpu.h): appends len entries to Tt and len + 1 to Sc / Sl. Uses the same
+// prefix_state()/step()/finish() calls as best_insert, so the values are bit-identical to what the CPU path computes.
+// Returns false (caller rolls the arrays back) if the route is infeasible at theta; base = cost of the suffix from k0 incl. return.
+static bool route_states(const Inst& I, const vector<int>& r, const vector<double>& T, int k0, double theta, Scratch& S, double& base,
+                         vector<double>& Tt, vector<double>& Sc, vector<int>& Sl) {
+  S.evals++;
+  int len = (int)r.size(), ld = 0;
+  State s = prefix_state(I, r, T, k0, S);
+  for (int p = 0; p < k0; p++) { Sl.push_back(ld); Sc.push_back(0.0); Tt.push_back(T[p]); ld += r[p] < I.n ? 1 : -1; }
+  Sl.push_back(s.load); Sc.push_back(s.cost);
+  for (int p = k0; p < len; p++) {
+    if (!step(I, s, r[p], theta, S)) return false;
+    Tt.push_back(s.t); Sl.push_back(s.load); Sc.push_back(s.cost);
+  }
+  if (!finish(I, s)) return false;
+  base = s.cost; return true;
+}
+// Fill one resident slot record for route r (static mode: k0 = 0). Caller guarantees r.size() + 2 <= GPU_LMAX.
+static void fill_slot(const Inst& I, const vector<int>& r, const vector<double>& T, double theta, Scratch& S, GpuSlot& g) {
+  static thread_local vector<double> Tt, Sc; static thread_local vector<int> Sl, where;
+  Tt.clear(); Sc.clear(); Sl.clear(); double base = 0;
+  int len = (int)r.size();
+  g.len = len; g.k0 = 0; g.pad_ = 0;
+  g.feasible = route_states(I, r, T, 0, theta, S, base, Tt, Sc, Sl) ? 1 : 0; g.base = base;
+  if (!g.feasible) return;
+  if ((int)where.size() < I.n) where.assign(I.n, -1);
+  for (int p = 0; p < len; p++) {
+    int v = r[p]; g.stops[p] = v; g.Tt[p] = Tt[p];
+    if (v < I.n) { where[v] = p; g.pp[p] = -1; } else g.pp[p] = where[v - I.n];
+  }
+  for (int p = 0; p <= len; p++) { g.Sc[p] = Sc[p]; g.Sl[p] = Sl[p]; }
+}
+#endif
 // Find best placement of request i over all vehicles; routes[k] may be overridden via 'over' (index, route) for local search.
 struct Placement { double delta = 1e300; int veh = -1, a = -1, b = -1; };
-static Placement best_over_vehicles(Ctx& C, const Sol& sol, const vector<int>* frozen, double theta, int i, int override_k, const vector<int>* over_r, const vector<double>* over_T) {
+static Placement best_over_vehicles_impl(Ctx& C, const Sol& sol, const vector<int>* frozen, double theta, int i, int override_k, const vector<int>* over_r, const vector<double>* over_T) {
   const Inst& I = C.I; int m = I.m;
   vector<int> cands; bool empty_taken = false;
   for (int k = 0; k < m; k++) {
@@ -162,31 +201,61 @@ static Placement best_over_vehicles(Ctx& C, const Sol& sol, const vector<int>* f
   }
   vector<Cand> res(cands.size());
 #ifdef USE_CUDA
-  if (g_gpu && (int)cands.size() >= g_gpu_min) {                  // offload: every (vehicle, pickup position, delivery position) candidate is evaluated on the GPU
+  if (g_gpu && g_resident && frozen == nullptr && (int)cands.size() >= g_gpu_min) {   // static mode: routes stay on the GPU, only changed ones are sent
+    double tp0 = g_prof.on ? now_s() : 0.0;
+    bool too_long = false;
+    for (int k : cands) { const vector<int>& r = (k == override_k) ? *over_r : sol.R[k]; if ((int)r.size() + 2 > GPU_LMAX) { too_long = true; break; } }
+    if (!too_long) {
+      static thread_local vector<int> cslot, uidx; static thread_local vector<GpuSlot> upd;
+      cslot.clear(); uidx.clear(); upd.clear();
+      for (int k : cands) {
+        if (k == override_k) { upd.emplace_back(); uidx.push_back(m); fill_slot(I, *over_r, *over_T, theta, C.S[0], upd.back()); cslot.push_back(m); }
+        else {
+          if (g_dirty[k]) { upd.emplace_back(); uidx.push_back(k); fill_slot(I, sol.R[k], sol.T[k], theta, C.S[0], upd.back()); g_dirty[k] = 0; }
+          cslot.push_back(k);
+        }
+      }
+      if (g_prof.on) g_prof.prep += now_s() - tp0;
+      vector<double> od(cands.size()); vector<int> oa(cands.size()), ob(cands.size());
+      double td0 = g_prof.on ? now_s() : 0.0;
+      if (!gpu_eval_slots((int)cslot.size(), cslot.data(), (int)upd.size(), uidx.data(), upd.data(), i, theta, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval_slots failed\n"); exit(2); }
+      if (g_prof.on) { g_prof.dev += now_s() - td0; g_prof.dev_calls++; g_prof.cands += (long long)cslot.size(); g_prof.upd += (long long)upd.size(); }
+      Placement p;
+      for (size_t c = 0; c < cands.size(); c++) if (oa[c] >= 0 && od[c] < p.delta) { p.delta = od[c]; p.veh = cands[c]; p.a = oa[c]; p.b = ob[c]; }
+      return p;
+    }
+    g_prof.fallback++;                                              // a route was too long for the GPU: this call runs on the CPU
+  } else if (g_gpu && (int)cands.size() >= g_gpu_min) {                  // offload: every (vehicle, pickup position, delivery position) candidate is evaluated on the GPU
     static thread_local vector<int> where;
-    vector<GpuCand> meta; vector<int> stops, pp, cmap; vector<double> Tf; bool too_long = false; Scratch& S0 = C.S[0];
+    double tp0 = g_prof.on ? now_s() : 0.0;
+    vector<GpuCand> meta; vector<int> stops, pp, cmap, Sl; vector<double> Tf, Sc; bool too_long = false; Scratch& S0 = C.S[0];
     if ((int)where.size() < I.n) where.assign(I.n, -1);
     for (size_t c = 0; c < cands.size() && !too_long; c++) {
       int k = cands[c]; const vector<int>& r = (k == override_k) ? *over_r : sol.R[k]; const vector<double>& T = (k == override_k) ? *over_T : sol.T[k];
       int k0 = frozen ? (*frozen)[k] : 0, len = (int)r.size();
       if (len + 2 > GPU_LMAX) { too_long = true; break; }
-      double base = 0; if (!suffix_cost(I, r, T, k0, theta, S0, base, nullptr)) { res[c].delta = 1e300; continue; }
-      State ps = prefix_state(I, r, T, k0, S0);
-      GpuCand g; g.off = (int)stops.size(); g.len = len; g.k0 = k0; g.base = base; g.t = ps.t; g.prev = ps.prev; g.load = ps.load; g.at_depot = ps.at_depot ? 1 : 0;
+      size_t s0 = Tf.size(), q0 = Sc.size(); double base = 0;
+      if (!route_states(I, r, T, k0, theta, S0, base, Tf, Sc, Sl)) { Tf.resize(s0); Sc.resize(q0); Sl.resize(q0); res[c].delta = 1e300; continue; }
+      GpuCand g; g.off = (int)stops.size(); g.qoff = (int)q0; g.len = len; g.k0 = k0; g.base = base;
       for (int p = 0; p < len; p++) {
-        int v = r[p]; stops.push_back(v); Tf.push_back(p < (int)T.size() ? T[p] : 0.0);
+        int v = r[p]; stops.push_back(v);
         if (v < I.n) { where[v] = p; pp.push_back(-1); } else pp.push_back(where[v - I.n]);
       }
       meta.push_back(g); cmap.push_back((int)c);
     }
+    if (g_prof.on) g_prof.prep += now_s() - tp0;
     if (!too_long) {
       vector<double> od(meta.size()); vector<int> oa(meta.size()), ob(meta.size());
-      if (!meta.empty() && !gpu_eval((int)meta.size(), meta.data(), stops.data(), (int)stops.size(), pp.data(), Tf.data(), i, theta, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval failed\n"); exit(2); }
+      double td0 = g_prof.on ? now_s() : 0.0;
+      if (!meta.empty() && !gpu_eval((int)meta.size(), meta.data(), stops.data(), (int)stops.size(), pp.data(), Tf.data(), Sc.data(), Sl.data(), (int)Sc.size(),
+                                     i, theta, od.data(), oa.data(), ob.data())) { fprintf(stderr, "gpu_eval failed\n"); exit(2); }
+      if (g_prof.on) { g_prof.dev += now_s() - td0; g_prof.dev_calls++; g_prof.cands += (long long)meta.size(); g_prof.stops += (long long)stops.size(); }
       for (size_t j = 0; j < meta.size(); j++) { res[cmap[j]].delta = od[j]; res[cmap[j]].a = oa[j]; res[cmap[j]].b = ob[j]; }
       Placement p;
       for (size_t c = 0; c < cands.size(); c++) if (res[c].a >= 0 && res[c].delta < p.delta) { p.delta = res[c].delta; p.veh = cands[c]; p.a = res[c].a; p.b = res[c].b; }
       return p;
     }
+    g_prof.fallback++;                                              // a route was too long for the GPU: this call runs on the CPU
     for (auto& x : res) x = Cand();
   }
 #endif
@@ -204,10 +273,18 @@ static Placement best_over_vehicles(Ctx& C, const Sol& sol, const vector<int>* f
   for (size_t c = 0; c < cands.size(); c++) if (res[c].a >= 0 && res[c].delta < p.delta) { p.delta = res[c].delta; p.veh = cands[c]; p.a = res[c].a; p.b = res[c].b; }
   return p;
 }
+static Placement best_over_vehicles(Ctx& C, const Sol& sol, const vector<int>* frozen, double theta, int i, int override_k, const vector<int>* over_r, const vector<double>* over_T) {
+  if (!g_prof.on) return best_over_vehicles_impl(C, sol, frozen, theta, i, override_k, over_r, over_T);
+  double t = now_s(); Placement p = best_over_vehicles_impl(C, sol, frozen, theta, i, override_k, over_r, over_T);
+  g_prof.search += now_s() - t; g_prof.calls++; return p;
+}
 static void apply(Ctx& C, Sol& sol, int k, const vector<int>& nr, int k0, double theta) {
   vector<double> T; double cost;
   suffix_cost(C.I, nr, sol.T[k], k0, theta, C.S[0], cost, &T);
   sol.R[k] = nr; sol.T[k] = T;
+#ifdef USE_CUDA
+  if (!g_dirty.empty()) g_dirty[k] = 1;
+#endif
 }
 static double route_cost(const Inst& I, const vector<int>& r, Scratch& S, bool& ok) {
   vector<double> none; double c = 0; ok = suffix_cost(I, r, none, 0, 0.0, S, c, nullptr); return c;
@@ -219,11 +296,19 @@ int main(int argc, char** argv) {
   string mode = argv[2]; int threads = argc > 3 ? atoi(argv[3]) : 1; int max_passes = argc > 4 ? atoi(argv[4]) : 30;
   long rss_load = proc_kb("VmRSS");
   Ctx C(I, threads); int n = I.n, m = I.m;
+  g_prof.on = getenv("DARP_PROF") && atoi(getenv("DARP_PROF"));
 #ifdef USE_CUDA
   if (getenv("DARP_GPU") && atoi(getenv("DARP_GPU"))) {            // DARP_GPU=1 enables the GPU path; DARP_GPU_MIN = fewest candidate routes worth a GPU call (default 32)
     GpuInstance G{I.V, I.n, I.Q, I.depot, I.s, I.H, I.alpha, I.beta, I.gamma, I.delta, I.wmax, I.D.data(), I.e.data(), I.l.data(), I.direct.data(), I.maxride.data(), I.po.data(), I.dn.data()};
     if (!gpu_init(G)) { fprintf(stderr, "gpu_init failed\n"); return 2; }
     g_gpu = true; if (getenv("DARP_GPU_MIN")) g_gpu_min = atoi(getenv("DARP_GPU_MIN"));
+    gpu_set_prof(g_prof.on);
+    // DARP_GPU_RESIDENT=0 turns off resident routes (every call then re-sends all candidate routes, as the dynamic mode always does).
+    g_resident = !(getenv("DARP_GPU_RESIDENT") && atoi(getenv("DARP_GPU_RESIDENT")) == 0);
+    if (g_resident) {
+      if (!gpu_slots_init(m + 1)) { fprintf(stderr, "gpu_slots_init failed\n"); return 2; }
+      g_dirty.assign(m, 1);
+    }
   }
 #endif
   Sol sol; sol.R.assign(m, {}); sol.T.assign(m, {}); sol.served.assign(n, 0);
@@ -285,6 +370,16 @@ int main(int argc, char** argv) {
   double secs = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
   long long steps = 0, evals = 0; for (auto& s : C.S) { steps += s.steps; evals += s.evals; }
   long rss_peak = proc_kb("VmHWM");
+  if (g_prof.on) {
+    double h2d = 0, kern = 0, d2h = 0, realloc_s = 0; long long bytes = 0, positions = 0, feas_a = 0, pairs = 0;
+#ifdef USE_CUDA
+    if (g_gpu) { GpuProf gp = gpu_get_prof(); h2d = gp.h2d; kern = gp.kernel; d2h = gp.d2h; realloc_s = gp.realloc; bytes = gp.bytes_h2d; positions = gp.positions; feas_a = gp.feas_a; pairs = gp.pairs; }
+#endif
+    fprintf(stderr, "{\"prof\":{\"runtime\":%.6f,\"search\":%.6f,\"calls\":%lld,\"prep\":%.6f,\"dev\":%.6f,\"dev_calls\":%lld,\"cands\":%lld,\"stops\":%lld,\"fallback\":%lld,\"upd\":%lld,"
+                    "\"h2d\":%.6f,\"kernel\":%.6f,\"d2h\":%.6f,\"realloc\":%.6f,\"bytes_h2d\":%lld,\"positions\":%lld,\"feas_a\":%lld,\"pairs\":%lld,\"steps\":%lld,\"passes\":%lld,\"m\":%d}}\n",
+            secs, g_prof.search, g_prof.calls, g_prof.prep, g_prof.dev, g_prof.dev_calls, g_prof.cands, g_prof.stops, g_prof.fallback, g_prof.upd,
+            h2d, kern, d2h, realloc_s, bytes, positions, feas_a, pairs, steps, passes, m);
+  }
   printf("{\"mode\":\"%s\",\"threads\":%d,\"runtime\":%.6f,\"steps\":%lld,\"evals\":%lld,\"maxrss_kb\":%ld,\"rss_load_kb\":%ld,\"ls_moves\":%lld,\"passes\":%lld,\"commit_violations\":%lld,\"served\":[", mode.c_str(), threads, secs, steps, evals, rss_peak, rss_load, ls_moves, passes, violations);
   for (int i = 0; i < n; i++) printf("%s%d", i ? "," : "", (int)sol.served[i]);
   printf("],\"routes\":[");
