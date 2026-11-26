@@ -1,8 +1,5 @@
 # Pre-registered hypotheses and predictions (written BEFORE the experiment seeds were run)
 
-Author of predictions: Claude (the team's AI teammate), asked by Ray Castaneda, Team 6.
-Date: 2026-11-25.
-
 ## What had and had not been run when this was written
 - The C++ solver was validated against the earlier Python heuristic (same Z to 6 digits, 5 instances).
 - Families F5 and F6 (the two adversarial families) were debugged on throwaway seeds (97, 98) until they behaved as designed; that is the only information about them that informs the predictions below (served % at n = 20, 100, 500 on seed 98).
